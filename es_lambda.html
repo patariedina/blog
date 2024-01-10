@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Elastic search auto delete</title>
+    <link rel="stylesheet" type="text/css" href="/static/style.css" />
+</head>
+<style>
+    body {
+        background-color: rgb(231, 238, 241);
+    }
+
+    pre {
+        background-color: white;
+    }
+</style>
+
+<body>
+    <div class="topnav" id="myTopnav">
+        <a href="blog">Blog Posts</a>
+        <a href="about">About Me</a>
+        <a href="home">Home</a>
+    </div>
+    <h1>Lambda that auto deletes indicies from Elastic search</h1>
+    <p>In this post I will be discussing a task that I completed for my day job, I wrote an AWS lambda in terraform
+        that automatically deletes indices from elastic search that are a year old. The lambda is triggered everyday
+        using
+        cloudwatch events, it checks the age of the indices and deletes the indices that are a year old. It also ignores
+        the configuration
+        indices and has variable in which you can specify the names of particular indices you wish to be exempt from the
+        auto deletion process.
+        The names of deleted indices are also displayed in the log. Before I created this script someone would have to
+        regularly go in and manually
+        delete the indices from the Kibana dashboard (hundreds are generated weekly). This lambda has removed the risk
+        of human error and ensures
+        compliance with data regulations.</p>
+    <h2>Configuration</h2>
+    <p>I used a <a href="https://registry.terraform.io/modules/terraform-aws-modules/lambda/aws/latest">lambda terraform
+            module</a> to handle the main
+        configuration of the lambda such as creating the zip of the lambda, creating the standard iam roles and polices,
+        in a previous lambda task
+        "" I manually created these components. The use of the module was particularly useful with this lambda because
+        there was many moving parts such
+        <a href="#vpc">vpc configuration</a> and the <a href="#pip">pip requirements</a>. I also needed to create an iam
+        role that allowed the lambda to
+        access the elastic search module.
+    </p>
+    <pre>
+        <code>
+            module "es_indcies_cleanup" {
+                source = "terraform-aws-modules/lambda/aws"
+                version = "6.5.0"
+                function_name = "indices_delete"
+                description   = "Lambda function that deletes indices from elastic search after x amount of days after creation"
+                runtime       = "python3.10"
+                handler       = "lambda_function.lambda_handler"
+                source_path = [
+                  "${path.module}/src/lambda_function.py",
+                  {
+                    pip_requirements = "${path.module}/requirements/requirements.txt"
+                  }
+                ]
+                environment_variables = {
+                  endpoint     = ** elastic search endpoint **
+                  exclude      = var.exclude
+                  delete_after = 360
+                }
+                vpc_security_group_ids = ** vpc security group id **
+                vpc_subnet_ids         = ** vpc subnet id **
+              
+                attach_policy                     = true
+                policy                            = ** policy that allows access to elastic search**
+                attach_network_policy             = true
+                attach_cloudwatch_logs_policy     = true
+                create_role                       = true
+                cloudwatch_logs_retention_in_days = 7
+              } 
+        </code>
+    </pre>
+    <p>The above code fragment shows the main configuration of lambda, the handler points to the main lambda function so
+        the file that the lambda function is
+        stored in is called lambda_function.py. The policy variable points to the arn of the policy that allows the
+        lambda to access to the elastic search node.
+        The various attach policy variables automatically attach i am policies needed to run a lambda and highlight the
+        benefits of using this module.
+    </p>
+    <h2>Lambda code</h2>
+    <pre>
+        <code>
+            import json
+            import os
+            import datetime
+            import requests
+            from requests_aws4auth import AWS4Auth
+            delete_after = int(os.environ['delete_after'])
+            endpoint = os.environ['endpoint']
+            service = 'es'
+            exclude = os.environ['exclude']
+            auth = AWS4Auth(os.environ['AWS_ACCESS_KEY_ID'], os.environ['AWS_SECRET_ACCESS_KEY'], os.environ['AWS_REGION'], service, session_token=os.environ['AWS_SESSION_TOKEN'])
+
+            def convertDate(s):
+                return datetime.datetime.strptime(s, '%Y-%m-%dT%H:%M:%S.%fZ')
+                
+            def returnIndicies():
+                try:
+                    getIndices = requests.get('https://' + endpoint + '/_cat/indices?h=index,creation.date.string&format=json&s=creation.date' , auth=auth)
+                except Exception as e:
+                    print("Unable to retrieve list of indices.")
+                    print(e)
+                    exit(3)
+                return getIndices.content
+
+            def lambda_handler(event, context):
+                allIndicies = json.loads(returnIndicies())
+                today = datetime.datetime.now()
+                for index in allIndicies: 
+                    if exclude.find(index["index"]) > -1 or index["index"].startswith('.') : 
+                        continue 
+                    diff = today - convertDate(index["creation.date.string"])
+                    if diff.days > delete_after:
+                        delete_index = requests.delete('https://' + endpoint+'/'+index["index"], auth=auth)
+                        delete_index.raise_for_status()
+                        print('deleting', index["index"], diff, 'old')
+                print('If any indicies have been deleted they will be displayed in the log')        
+                return "If any indicies have been deleted they will be displayed in the log"
+        </code>
+    </pre>
+    <p>This is the lambda function that actually deletes the indices from elastic search, the returnIndicies() function
+        returns a JSON list of all the indiciesordered by creation date. The lambda_handler function iterates through
+        the list of indices for each of the indices it checks 'exclude.find(index["index"]) > -1' this looks too see if
+        the index name has been declared in
+        the exclude variable using the find method, the find method returns -1 if the value is not found. Then it looks
+        too see if this current index is a configuration index, the configuration index start with a '.' If none of
+        these conditions are met we remain at the same index and continue
+        the loop. Then the value diff is worked out which is how the long index has been alive, using the convertDate()
+        method from earlier it puts the creation date of the index
+        into a format that can be used to compare with today's date. If the value of diff is greater than the value of
+        delete_after which in my case I have set to 360 days
+        then the index will be deleted and the name and age of the deleted index will be displayed in the log</p>
+
+    <h3>Interesting error</h3>
+    <p>When creating this function I initially had the logic set to 'if index[index] == exclude' but with this I was not
+        able too pass in more that
+        value into the exclude parameter and as you can imagine there was more than value needed, so I decided to go
+        with find method in which I can pass in
+        multiple in the form of a string, the values are separated by commas just for ease of reading but this is not
+        needed e.g (hat, scarf, jacket). Now the
+        logic works by see if the name of the index exists within the list of exclude rather than looking for an exact
+        letter to letter match.
+
+    </p>
+    <h2 id="pip"> Pip requirements.txt</h2>
+    <p>From the code you can see there are many dependencies needed to run this lambda function, there are also a few
+        different options to get these dependencies in the code. When I first tested out this lambda I created it using
+        click-ops in AWS console before actually replicating it in terraform, when in the console I used a layer to add
+        in the dependencies. This involved downloading the .whl for all the dependencies from the pypi website,
+        unzipping them, placing all the files into a folder called python (needed to be called python so that it would
+        be picked up properly from the system) zipping it back up and uploading to the console. I encounteed errors
+        when trying to use a layer with the lambda module, it would only pick up one import and not rest which made
+        resolving the issue quite tricky because the layer was partially pulling through. In my research to solved this
+        error I came across pip requirements.txt which is essentially just a text file where you list the packages and
+        versions needed to be installed by pip, the module I used also nicely catered to pip requirements as I just
+        needed to state the path where the requirements file lives. This solution was a lot neater and simpler than
+        using a layer and makes editing the requirements versions very easy and intuitive as time goes on especially
+        since this is for work and different people may work on this code.
+
+    </p>
+    <h2>Cloudwatch alarms</h2>
+    <pre>
+        <code>
+            resource "aws_cloudwatch_event_rule" "es_indcies_cleanup_rule" {
+                name        = "es_indicies_cleanup_rule"
+                description = "Fires everyday at 10pm to delete indices from elastic search that are a year old"
+                #  cron(Minutes Hours Dayofmonth Month Dayofweek Year) and ? is for leaving the day of week blank
+                #  and in effect it is the same as '*'
+                schedule_expression = "cron(0 22 * * ? *)"
+              }
+              
+              #  Define AWS Lambda function as target to the above rule when it triggers
+              resource "aws_cloudwatch_event_target" "es_indcies_cleanup_target" {
+                rule      = aws_cloudwatch_event_rule.es_indcies_cleanup_rule.name
+                target_id = "indices_delete_policy"
+                arn       = module.es_indcies_cleanup.lambda_function_arn
+              }
+              resource "aws_lambda_permission" "allow_cloudwatch_permission" {
+                statement_id  = "AllowExecutionFromCloudWatch"
+                action        = "lambda:InvokeFunction"
+                function_name = module.es_indcies_cleanup.lambda_function_name
+                principal     = "events.amazonaws.com"
+                source_arn    = aws_cloudwatch_event_rule.es_indcies_cleanup_rule.arn
+              }
+        </code>
+    </pre>
+    <p>The above code fragment is the configuration of the cloudwatch alarms</p>
+    <h2 id="vpc"> VPC configuration</h2>
+    <p>For this lambda to work given the configuration of my network, the lambda needed to be placed in the same VPC as
+        the elastic search instance and also be given IAM policies to allow the lambda to talk to the elastic search
+        instance, the configuration of the elastic search instance did not need to be edited</p>
+</body>
+<script>
+    function myFunction() {
+      var x = document.getElementById("myTopnav");
+      if (x.className === "topnav") {
+        x.className += " responsive";
+      } else {
+        x.className = "topnav";
+      }
+    }
+    </script>
+
+</html>
